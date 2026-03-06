@@ -1,0 +1,185 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: BroadcastSenderFX
+  APP_VERSION: 1.0.0
+  MAIN_CLASS: com.broadcastsender.MainApp
+  JLINK_MODULES: >-
+    java.base,java.desktop,java.logging,java.management,java.naming,
+    java.net.http,java.prefs,java.sql,java.xml,
+    javafx.controls,javafx.fxml,javafx.graphics,javafx.base,javafx.swing,
+    jdk.crypto.ec,jdk.crypto.cryptoki,jdk.unsupported
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Liberica JDK 17 Full (includes JavaFX modules)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'liberica'
+          java-package: 'jdk+fx'
+          cache: 'gradle'
+
+      - name: Build project and create distributable layout
+        run: .\gradlew.bat build installDist
+        shell: pwsh
+
+      - name: Install WiX Toolset (required by jpackage for .exe/.msi on Windows)
+        run: choco install wixtoolset -y --no-progress
+        shell: pwsh
+
+      - name: Add WiX Toolset to PATH
+        run: |
+          $wixDir = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX*" -ErrorAction SilentlyContinue `
+            | Sort-Object Name -Descending `
+            | Select-Object -First 1 -ExpandProperty FullName
+          if ($wixDir) {
+            "$wixDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Added WiX to PATH: $wixDir\bin"
+          } else {
+            Write-Warning "WiX directory not found — jpackage may fail to create .msi/.exe"
+          }
+        shell: pwsh
+
+      - name: Create custom JRE with jlink
+        run: |
+          # Remove spaces/newlines introduced by the YAML block scalar in JLINK_MODULES
+          $modules = "$env:JLINK_MODULES" -replace '\s',''
+          jlink `
+            --add-modules $modules `
+            --output build\runtime `
+            --strip-debug `
+            --no-header-files `
+            --no-man-pages `
+            --compress=2
+        shell: pwsh
+
+      - name: Prepare jpackage input directory (exclude JavaFX JARs already bundled in runtime)
+        run: |
+          New-Item -ItemType Directory -Path build\jpackage-input -Force | Out-Null
+          Get-ChildItem "build\install\$env:APP_NAME\lib" -Filter "*.jar" `
+            | Where-Object { $_.Name -notlike "javafx-*" } `
+            | ForEach-Object { Copy-Item $_.FullName build\jpackage-input\ }
+        shell: pwsh
+
+      - name: Create .exe installer with jpackage (per-user, no admin required)
+        run: |
+          New-Item -ItemType Directory -Path output -Force | Out-Null
+          jpackage `
+            --type exe `
+            --name "$env:APP_NAME" `
+            --app-version "$env:APP_VERSION" `
+            --input build\jpackage-input `
+            --main-jar "$env:APP_NAME-$env:APP_VERSION.jar" `
+            --main-class "$env:MAIN_CLASS" `
+            --runtime-image build\runtime `
+            --java-options "--add-modules javafx.controls,javafx.fxml" `
+            --win-per-user-install `
+            --win-dir-chooser `
+            --win-shortcut `
+            --win-menu `
+            --dest output
+        shell: pwsh
+
+      - name: Create .msi installer with jpackage (per-user, no admin required)
+        run: |
+          jpackage `
+            --type msi `
+            --name "$env:APP_NAME" `
+            --app-version "$env:APP_VERSION" `
+            --input build\jpackage-input `
+            --main-jar "$env:APP_NAME-$env:APP_VERSION.jar" `
+            --main-class "$env:MAIN_CLASS" `
+            --runtime-image build\runtime `
+            --java-options "--add-modules javafx.controls,javafx.fxml" `
+            --win-per-user-install `
+            --win-dir-chooser `
+            --win-shortcut `
+            --win-menu `
+            --dest output
+        shell: pwsh
+
+      - name: Assemble portable distribution
+        run: |
+          New-Item -ItemType Directory -Path portable\runtime -Force | Out-Null
+          New-Item -ItemType Directory -Path portable\app -Force | Out-Null
+
+          # Copy the custom JRE produced by jlink
+          Copy-Item build\runtime\* portable\runtime\ -Recurse
+
+          # Copy app JARs — exclude JavaFX JARs (they are already part of the runtime)
+          Get-ChildItem "build\install\$env:APP_NAME\lib" -Filter "*.jar" `
+            | Where-Object { $_.Name -notlike "javafx-*" } `
+            | ForEach-Object { Copy-Item $_.FullName portable\app\ }
+
+          # Create a Windows batch launcher
+          $launcher = @"
+@echo off
+setlocal
+set APP_DIR=%~dp0
+"%APP_DIR%runtime\bin\java" --add-modules javafx.controls,javafx.fxml -cp "%APP_DIR%app\*" $env:MAIN_CLASS %*
+endlocal
+"@
+          Set-Content -Path "portable\$env:APP_NAME.bat" -Value $launcher -Encoding ASCII
+        shell: pwsh
+
+      - name: Create portable ZIP
+        run: Compress-Archive -Path portable\* -DestinationPath "$env:APP_NAME-portable.zip"
+        shell: pwsh
+
+      # ── Upload to the most recent release (push to main only) ──────────────
+
+      - name: Get latest release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: get_release
+        run: |
+          $tag = gh release list --limit 1 --json tagName --jq '.[0].tagName'
+          if (-not $tag) {
+            Write-Error "No releases found. Please create a GitHub release before pushing to main — artifacts require an existing release target."
+            exit 1
+          }
+          Write-Host "Latest release tag: $tag"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload .exe, .msi, and portable ZIP to latest release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          $tag = "${{ steps.get_release.outputs.tag }}"
+
+          $exeFile = Get-ChildItem output -Filter "*.exe" | Select-Object -First 1 -ExpandProperty FullName
+          $msiFile = Get-ChildItem output -Filter "*.msi" | Select-Object -First 1 -ExpandProperty FullName
+          $zipFile = "$env:APP_NAME-portable.zip"
+
+          if (-not $exeFile) { Write-Error "No .exe installer found in output/"; exit 1 }
+          if (-not $msiFile) { Write-Error "No .msi installer found in output/"; exit 1 }
+          if (-not (Test-Path $zipFile)) { Write-Error "Portable ZIP '$zipFile' not found"; exit 1 }
+
+          Write-Host "Uploading to release '$tag':"
+          Write-Host "  EXE : $exeFile"
+          Write-Host "  MSI : $msiFile"
+          Write-Host "  ZIP : $zipFile"
+
+          gh release upload $tag "$exeFile" "$msiFile" "$zipFile" --clobber
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
